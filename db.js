@@ -261,8 +261,8 @@ function seed() {
 
 // --- Run directly ---
 if (require.main === module) {
-  const seeded = seed();
-  console.log(seeded ? 'Database seeded with test data.' : 'Database already has data, skipping seed.');
+//  const seeded = seed();
+//  console.log(seeded ? 'Database seeded with test data.' : 'Database already has data, skipping seed.');
   console.log('Stats:', getStats());
 }
 
