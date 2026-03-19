@@ -177,14 +177,15 @@ try {
   const mqttClient = mqtt.connect(config.mqtt.broker, options);
   mqttClient.on('connect', () => {
     console.log(`MQTT connected to ${config.mqtt.broker}`);
-    // Subscribe to both packet-logging format and companion bridge format
-    mqttClient.subscribe(config.mqtt.topic, (err) => {
+    // Accept a single topic string or an array of topics in config.
+    const configuredTopics = Array.isArray(config.mqtt.topic)
+      ? config.mqtt.topic
+      : [config.mqtt.topic];
+    const topics = [...new Set([...configuredTopics.filter(Boolean)])];
+
+    mqttClient.subscribe(topics, (err) => {
       if (err) console.error('MQTT subscribe error:', err);
-      else console.log(`MQTT subscribed to ${config.mqtt.topic}`);
-    });
-    mqttClient.subscribe('meshcore/#', (err) => {
-      if (err) console.error('MQTT subscribe error (bridge):', err);
-      else console.log('MQTT subscribed to meshcore/#');
+      else console.log(`MQTT subscribed to: ${topics.join(', ')}`);
     });
   });
   mqttClient.on('error', () => {}); // MQTT errors are expected when broker is offline
