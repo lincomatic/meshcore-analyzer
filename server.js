@@ -26,7 +26,28 @@ function computeContentHash(rawHex) {
   } catch { return rawHex.slice(0, 16); }
 }
 const db = require('./db');
-const channelKeys = require("./config.json").channelKeys || {};
+const configuredChannelKeys = config.channelKeys || {};
+const hashChannels = Array.isArray(config.hashChannels) ? config.hashChannels : [];
+
+function deriveHashtagChannelKey(channelName) {
+  return crypto.createHash('sha256').update(channelName).digest('hex').slice(0, 32);
+}
+
+const derivedHashChannelKeys = {};
+for (const rawChannel of hashChannels) {
+  if (typeof rawChannel !== 'string') continue;
+  const trimmed = rawChannel.trim();
+  if (!trimmed) continue;
+  const channelName = trimmed.startsWith('#') ? trimmed : `#${trimmed}`;
+  if (Object.prototype.hasOwnProperty.call(configuredChannelKeys, channelName)) continue;
+  derivedHashChannelKeys[channelName] = deriveHashtagChannelKey(channelName);
+}
+
+const channelKeys = { ...derivedHashChannelKeys, ...configuredChannelKeys };
+
+if (Object.keys(derivedHashChannelKeys).length > 0) {
+  console.log(`Derived ${Object.keys(derivedHashChannelKeys).length} channel key(s) from hashChannels`);
+}
 
 // Seed DB if empty
 db.seed();
