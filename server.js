@@ -161,7 +161,20 @@ function autoLearnHopNodes(hops, now) {
 
 // --- MQTT ---
 try {
-  const mqttClient = mqtt.connect(config.mqtt.broker, { reconnectPeriod: 5000 });
+    const clientId = `mqtt_${Math.random().toString(16).slice(3)}`;
+
+    const options = {
+	clientId,
+	clean: true,
+	connectTimeout: 4000,
+	username: config.mqtt.user,
+	password: config.mqtt.pass,
+	protocolVersion: 4, // 4 corresponds to MQTT v3.1.1
+	reconnectPeriod: 5000,
+	rejectUnauthorized: !config.mqtt.tls_insecure
+    };
+
+  const mqttClient = mqtt.connect(config.mqtt.broker, options);
   mqttClient.on('connect', () => {
     console.log(`MQTT connected to ${config.mqtt.broker}`);
     // Subscribe to both packet-logging format and companion bridge format
