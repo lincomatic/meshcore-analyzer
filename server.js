@@ -2,6 +2,8 @@
 
 const express = require('express');
 const http = require('http');
+const https = require('https');
+const fs = require('fs');
 const { WebSocketServer } = require('ws');
 const mqtt = require('mqtt');
 const path = require('path');
@@ -53,7 +55,17 @@ if (Object.keys(derivedHashChannelKeys).length > 0) {
 db.seed();
 
 const app = express();
-const server = http.createServer(app);
+
+let server;
+if (config.https && config.https.cert && config.https.key) {
+  const tlsOptions = {
+    cert: fs.readFileSync(config.https.cert),
+    key: fs.readFileSync(config.https.key),
+  };
+  server = https.createServer(tlsOptions, app);
+} else {
+  server = http.createServer(app);
+}
 
 // --- WebSocket ---
 const wss = new WebSocketServer({ server });
@@ -1463,8 +1475,10 @@ app.get('/{*splat}', (req, res) => {
 });
 
 // --- Start ---
+const isHttps = config.https && config.https.cert && config.https.key;
 server.listen(process.env.PORT || config.port, () => {
-  console.log(`MeshCore Analyzer running on http://localhost:${config.port}`);
+  const proto = isHttps ? 'https' : 'http';
+  console.log(`MeshCore Analyzer running on ${proto}://localhost:${process.env.PORT || config.port}`);
 });
 
 module.exports = { app, server, wss };
