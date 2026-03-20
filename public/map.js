@@ -96,7 +96,7 @@
       </div>`;
 
     // Init Leaflet — restore saved position or default to Bay Area
-    const defaultCenter = [37.6, -122.1];
+    const defaultCenter = [33.8, -117.9];
     const defaultZoom = 9;
     let initCenter = defaultCenter;
     let initZoom = defaultZoom;

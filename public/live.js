@@ -652,7 +652,7 @@
     map = L.map('liveMap', {
       zoomControl: false, attributionControl: false,
       zoomAnimation: true, markerZoomAnimation: true
-    }).setView([37.45, -122.0], 9);
+    }).setView([33.8, -117.9], 9);
 
     const isDark = document.documentElement.getAttribute('data-theme') === 'dark' ||
       (document.documentElement.getAttribute('data-theme') !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
