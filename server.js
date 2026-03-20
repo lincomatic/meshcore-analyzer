@@ -52,7 +52,7 @@ if (Object.keys(derivedHashChannelKeys).length > 0) {
 }
 
 // Seed DB if empty
-db.seed();
+//db.seed();
 
 const app = express();
 
