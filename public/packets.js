@@ -287,6 +287,7 @@
         <select id="fRegion" aria-label="Filter by region"><option value="">All Regions</option></select>
         <select id="fType" aria-label="Filter by packet type"><option value="">All Types</option></select>
         <button class="btn ${groupByHash ? 'active' : ''}" id="fGroup">Group by Hash</button>
+        <button class="btn" id="fMyNodes" title="Show only packets from claimed/favorited nodes">★ My Nodes</button>
         <div class="col-toggle-wrap">
           <button class="col-toggle-btn" id="colToggleBtn">Columns ▾</button>
           <div class="col-toggle-menu" id="colToggleMenu"></div>
@@ -324,6 +325,11 @@
     document.getElementById('fRegion').addEventListener('change', (e) => { filters.region = e.target.value || undefined; loadPackets(); });
     document.getElementById('fType').addEventListener('change', (e) => { filters.type = e.target.value !== '' ? e.target.value : undefined; loadPackets(); });
     document.getElementById('fGroup').addEventListener('click', () => { groupByHash = !groupByHash; loadPackets(); });
+    document.getElementById('fMyNodes').addEventListener('click', function () {
+      filters.myNodes = !filters.myNodes;
+      this.classList.toggle('active', filters.myNodes);
+      loadPackets();
+    });
 
     // Column visibility toggle (#71)
     const COL_DEFS = [
@@ -494,14 +500,34 @@
     const groupBtn = document.getElementById('fGroup');
     if (groupBtn) groupBtn.classList.toggle('active', groupByHash);
 
-    if (!packets.length) {
-      tbody.innerHTML = '<tr><td colspan="10" class="text-center text-muted" style="padding:24px">No packets found</td></tr>';
+    // Filter to claimed/favorited nodes if toggle is on
+    let displayPackets = packets;
+    if (filters.myNodes) {
+      const myNodes = JSON.parse(localStorage.getItem('meshcore-my-nodes') || '[]');
+      const myKeys = new Set(myNodes.map(n => n.pubkey));
+      const favs = getFavorites();
+      const allKeys = new Set([...myKeys, ...favs]);
+      displayPackets = packets.filter(p => {
+        try {
+          const d = JSON.parse(p.decoded_json || '{}');
+          const pathHops = JSON.parse(p.path_json || '[]');
+          // Check if any node key in decoded data or path matches
+          return (d.pubkey && allKeys.has(d.pubkey)) ||
+                 (d.to && allKeys.has(d.to)) ||
+                 (d.from && allKeys.has(d.from)) ||
+                 pathHops.some(h => allKeys.has(h));
+        } catch { return false; }
+      });
+    }
+
+    if (!displayPackets.length) {
+      tbody.innerHTML = '<tr><td colspan="10" class="text-center text-muted" style="padding:24px">' + (filters.myNodes ? 'No packets from your claimed/favorited nodes' : 'No packets found') + '</td></tr>';
       return;
     }
 
     if (groupByHash) {
       let html = '';
-      for (const p of packets) {
+      for (const p of displayPackets) {
         const isExpanded = expandedHashes.has(p.hash);
         const groupRegion = p.observer_id ? (observers.find(o => o.id === p.observer_id)?.iata || '') : '';
         let groupPath = [];
@@ -551,7 +577,7 @@
       return;
     }
 
-    tbody.innerHTML = packets.map(p => {
+    tbody.innerHTML = displayPackets.map(p => {
       let decoded, pathHops = [];
       try { decoded = JSON.parse(p.decoded_json); } catch {}
       try { pathHops = JSON.parse(p.path_json || '[]'); } catch {}

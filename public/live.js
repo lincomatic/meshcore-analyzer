@@ -64,10 +64,28 @@
     let resizeTimer = null;
     _onResize = function() {
       clearTimeout(resizeTimer);
-      resizeTimer = setTimeout(() => { if (map) map.invalidateSize({ animate: false }); }, 150);
+      resizeTimer = setTimeout(() => {
+        // Set live-page height from JS — most reliable across all mobile browsers
+        const page = document.querySelector('.live-page');
+        const appEl = document.getElementById('app');
+        const h = window.innerHeight;
+        if (page) page.style.height = h + 'px';
+        if (appEl) appEl.style.height = h + 'px';
+        if (map) {
+          map.invalidateSize({ animate: false, pan: false });
+        }
+      }, 50);
     };
+    // Run immediately to set correct initial height
+    _onResize();
     window.addEventListener('resize', _onResize);
-    window.addEventListener('orientationchange', () => setTimeout(_onResize, 200));
+    window.addEventListener('orientationchange', () => {
+      // Orientation change is async — viewport dimensions settle late
+      [50, 200, 500, 1000, 2000].forEach(ms => setTimeout(_onResize, ms));
+    });
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener('resize', _onResize);
+    }
   }
 
   // === VCR Controls ===
@@ -604,7 +622,6 @@
 
         <!-- VCR Bar -->
         <div class="vcr-bar" id="vcrBar">
-          <div class="vcr-left">
           <div class="vcr-controls">
             <button id="vcrRewindBtn" class="vcr-btn" title="Rewind" aria-label="Rewind">⏪</button>
             <button id="vcrPauseBtn" class="vcr-btn" title="Pause/Play" aria-label="Pause">⏸</button>
@@ -612,19 +629,16 @@
             <button id="vcrSpeedBtn" class="vcr-btn" title="Playback speed" aria-label="Speed 1x">1x</button>
             <div id="vcrMode" class="vcr-mode vcr-mode-live"><span class="vcr-live-dot"></span> LIVE</div>
           </div>
-          <div class="vcr-timeline-wrap">
-            <div class="vcr-scope-btns" role="radiogroup" aria-label="Timeline scope">
-              <button class="vcr-scope-btn active" data-scope="3600000" role="radio" aria-checked="true" aria-label="Scope 1 hour">1h</button>
-              <button class="vcr-scope-btn" data-scope="21600000" role="radio" aria-checked="false" aria-label="Scope 6 hours">6h</button>
-              <button class="vcr-scope-btn" data-scope="43200000" role="radio" aria-checked="false" aria-label="Scope 12 hours">12h</button>
-              <button class="vcr-scope-btn" data-scope="86400000" role="radio" aria-checked="false" aria-label="Scope 24 hours">24h</button>
-            </div>
-            <div class="vcr-timeline-container">
-              <canvas id="vcrTimeline" class="vcr-timeline"></canvas>
-              <div id="vcrPlayhead" class="vcr-playhead"></div>
-              <div id="vcrTimeTooltip" class="vcr-time-tooltip hidden"></div>
-            </div>
+          <div class="vcr-scope-btns" role="radiogroup" aria-label="Timeline scope">
+            <button class="vcr-scope-btn active" data-scope="3600000" role="radio" aria-checked="true" aria-label="Scope 1 hour">1h</button>
+            <button class="vcr-scope-btn" data-scope="21600000" role="radio" aria-checked="false" aria-label="Scope 6 hours">6h</button>
+            <button class="vcr-scope-btn" data-scope="43200000" role="radio" aria-checked="false" aria-label="Scope 12 hours">12h</button>
+            <button class="vcr-scope-btn" data-scope="86400000" role="radio" aria-checked="false" aria-label="Scope 24 hours">24h</button>
           </div>
+          <div class="vcr-timeline-container">
+            <canvas id="vcrTimeline" class="vcr-timeline"></canvas>
+            <div id="vcrPlayhead" class="vcr-playhead"></div>
+            <div id="vcrTimeTooltip" class="vcr-time-tooltip hidden"></div>
           </div>
           <div class="vcr-lcd">
             <div class="vcr-lcd-row vcr-lcd-mode" id="vcrLcdMode">LIVE</div>
@@ -640,7 +654,19 @@
       zoomAnimation: true, markerZoomAnimation: true
     }).setView([37.45, -122.0], 9);
 
-    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', { maxZoom: 19 }).addTo(map);
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark' ||
+      (document.documentElement.getAttribute('data-theme') !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+    const DARK_TILES = 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png';
+    const LIGHT_TILES = 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png';
+    let tileLayer = L.tileLayer(isDark ? DARK_TILES : LIGHT_TILES, { maxZoom: 19 }).addTo(map);
+
+    // Swap tiles when theme changes
+    const _themeObs = new MutationObserver(function () {
+      const dark = document.documentElement.getAttribute('data-theme') === 'dark' ||
+        (document.documentElement.getAttribute('data-theme') !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+      tileLayer.setUrl(dark ? DARK_TILES : LIGHT_TILES);
+    });
+    _themeObs.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
     L.control.zoom({ position: 'topright' }).addTo(map);
 
     nodesLayer = L.layerGroup().addTo(map);
@@ -717,9 +743,9 @@
     const legendToggleBtn = document.getElementById('legendToggleBtn');
     if (legendToggleBtn && legendEl) {
       legendToggleBtn.addEventListener('click', () => {
-        const isHidden = legendEl.classList.toggle('legend-mobile-hidden');
-        legendToggleBtn.setAttribute('aria-label', isHidden ? 'Show legend' : 'Hide legend');
-        legendToggleBtn.textContent = isHidden ? '🎨' : '✕';
+        const isVisible = legendEl.classList.toggle('legend-mobile-visible');
+        legendToggleBtn.setAttribute('aria-label', isVisible ? 'Hide legend' : 'Show legend');
+        legendToggleBtn.textContent = isVisible ? '✕' : '🎨';
       });
     }
 
@@ -1430,7 +1456,14 @@
     if (_rateCounterInterval) { clearInterval(_rateCounterInterval); _rateCounterInterval = null; }
     if (ws) { ws.onclose = null; ws.close(); ws = null; }
     if (map) { map.remove(); map = null; }
-    if (_onResize) { window.removeEventListener('resize', _onResize); window.removeEventListener('orientationchange', _onResize); }
+    if (_onResize) {
+      window.removeEventListener('resize', _onResize);
+      window.removeEventListener('orientationchange', _onResize);
+      if (window.visualViewport) window.visualViewport.removeEventListener('resize', _onResize);
+    }
+    // Restore #app height to CSS default
+    const appEl = document.getElementById('app');
+    if (appEl) appEl.style.height = '';
     const topNav = document.querySelector('.top-nav');
     if (topNav) { topNav.classList.remove('nav-autohide'); topNav.style.position = ''; topNav.style.width = ''; topNav.style.zIndex = ''; }
     if (_navCleanup) {
