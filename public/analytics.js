@@ -805,18 +805,18 @@
         const count = nodes.length;
         let bg, color;
         if (count === 0) {
-          bg = '#166534'; color = '#86efac'; // green — available
+          bg = 'var(--card-bg)'; color = 'var(--text-muted)'; // empty — subtle
         } else if (count === 1) {
-          bg = '#854d0e'; color = '#fde047'; // yellow — taken, no collision
+          bg = '#dcfce7'; color = '#166534'; // light green — taken, no collision
         } else {
-          // 2+ nodes: interpolate orange→red
+          // 2+ nodes: orange→red
           const t = Math.min((count - 2) / 4, 1);
-          const g = Math.round(80 * (1 - t));
-          bg = `rgb(200,${g},30)`; color = '#fff';
+          const r = Math.round(220 + 35 * t);
+          const g = Math.round(120 * (1 - t));
+          bg = `rgb(${r},${g},30)`; color = '#fff';
         }
         const status = count === 0 ? 'available' : count === 1 ? `1 node: ${nodes[0].name || nodes[0].public_key.slice(0,12)}` : `${count} nodes — COLLISION`;
-        const countLabel = count === 0 ? '·' : count >= 3 ? '3+' : String(count);
-        const cellText = count >= 2 ? `<strong>${countLabel}</strong>` : countLabel;
+        const cellText = count === 0 ? `<span style="font-size:11px">${hex}</span>` : count >= 2 ? `<strong>${count >= 3 ? '3+' : count}</strong>` : String(count);
         html += `<td class="hash-cell${count ? ' hash-active' : ''}" data-hex="${hex}" style="width:${cellSize}px;height:${cellSize}px;text-align:center;background:${bg};color:${color};border:1px solid var(--border);cursor:${count ? 'pointer' : 'default'};font-size:13px;font-weight:${count >= 2 ? '700' : '400'}" title="0x${hex}: ${status}">${cellText}</td>`;
       }
       html += '</tr>';
@@ -824,8 +824,8 @@
     html += '</table></div>';
     html += `<div id="hashDetail" style="flex:1;min-width:200px;max-width:400px;font-size:0.85em"></div></div>
     <div style="margin-top:8px;font-size:0.8em;display:flex;gap:16px;align-items:center">
-      <span><span class="legend-swatch" style="background:#166534"></span> 0 — Available</span>
-      <span><span class="legend-swatch" style="background:#854d0e"></span> 1 — One node</span>
+      <span><span class="legend-swatch" style="background:var(--card-bg);border:1px solid var(--border)"></span> 0 — Available</span>
+      <span><span class="legend-swatch" style="background:#dcfce7"></span> 1 — One node</span>
       <span><span class="legend-swatch" style="background:rgb(200,80,30)"></span> 2 — Two nodes (collision)</span>
       <span><span class="legend-swatch" style="background:rgb(200,0,30)"></span> 3+ — Three+ nodes (collision)</span>
     </div>`;
@@ -1140,19 +1140,19 @@
   async function renderNodesTab(el) {
     el.innerHTML = '<div style="padding:40px;text-align:center;color:var(--text-muted)">Loading node analytics…</div>';
     try {
-      const nodes = await api('/nodes?limit=200&sortBy=lastSeen');
+      const [nodesResp, bulkHealth, netStatus] = await Promise.all([
+        api('/nodes?limit=200&sortBy=lastSeen'),
+        api('/nodes/bulk-health?limit=50'),
+        api('/nodes/network-status')
+      ]);
+      const nodes = nodesResp.nodes || nodesResp;
       const myNodes = JSON.parse(localStorage.getItem('meshcore-my-nodes') || '[]');
       const myKeys = new Set(myNodes.map(n => n.pubkey));
 
-      // Fetch health data for top nodes (limit to avoid hammering)
-      const topNodes = nodes.slice(0, 50);
-      const healthResults = await Promise.allSettled(
-        topNodes.map(n => api('/nodes/' + encodeURIComponent(n.public_key) + '/health').then(h => ({ ...n, health: h })))
-      );
-      const enriched = healthResults
-        .filter(r => r.status === 'fulfilled')
-        .map(r => r.value)
-        .filter(n => n.health);
+      // Map bulk health by pubkey
+      const healthMap = {};
+      bulkHealth.forEach(h => { healthMap[h.public_key] = h; });
+      const enriched = nodes.filter(n => healthMap[n.public_key]).map(n => ({ ...n, health: { stats: healthMap[n.public_key].stats, observers: healthMap[n.public_key].observers } }));
 
       // Compute rankings
       const byPackets = [...enriched].sort((a, b) => (b.health.stats.totalPackets || 0) - (a.health.stats.totalPackets || 0));
@@ -1160,24 +1160,8 @@
       const byObservers = [...enriched].sort((a, b) => (b.health.observers?.length || 0) - (a.health.observers?.length || 0));
       const byRecent = [...enriched].filter(n => n.health.stats.lastHeard).sort((a, b) => new Date(b.health.stats.lastHeard) - new Date(a.health.stats.lastHeard));
 
-      // Status counts
-      const now = Date.now();
-      let active = 0, degraded = 0, silent = 0;
-      enriched.forEach(n => {
-        const lh = n.health.stats.lastHeard;
-        const age = lh ? now - new Date(lh).getTime() : Infinity;
-        const role = (n.role || '').toLowerCase();
-        const isInfra = role === 'repeater' || role === 'room';
-        const degradedMs = isInfra ? 86400000 : 3600000;
-        const silentMs = isInfra ? 259200000 : 86400000;
-        if (age < degradedMs) active++;
-        else if (age < silentMs) degraded++;
-        else silent++;
-      });
-
-      // Role breakdown
-      const roleCounts = {};
-      nodes.forEach(n => { const r = n.role || 'unknown'; roleCounts[r] = (roleCounts[r] || 0) + 1; });
+      // Use server-computed status across ALL nodes
+      const { active, degraded, silent, total: totalNodes, roleCounts } = netStatus;
 
       function nodeLink(n) {
         return `<a href="#/nodes/${encodeURIComponent(n.public_key)}/analytics" class="analytics-link">${esc(n.name || n.public_key.slice(0, 12))}</a>`;
@@ -1205,7 +1189,7 @@
               <div style="font-size:11px;text-transform:uppercase;color:var(--text-muted)">🔴 Silent</div>
             </div>
             <div class="analytics-stat-card" style="flex:1;min-width:120px;text-align:center;padding:16px;background:var(--card-bg);border:1px solid var(--border);border-radius:8px">
-              <div style="font-size:28px;font-weight:700">${nodes.length}</div>
+              <div style="font-size:28px;font-weight:700">${totalNodes}</div>
               <div style="font-size:11px;text-transform:uppercase;color:var(--text-muted)">Total Nodes</div>
             </div>
           </div>

@@ -5,6 +5,16 @@
   let nodes = [];
   const PAYLOAD_TYPES = {0:'Request',1:'Response',2:'Direct Msg',3:'ACK',4:'Advert',5:'Channel Msg',7:'Anon Req',8:'Path',9:'Trace'};
 
+  function syncClaimedToFavorites() {
+    const myNodes = JSON.parse(localStorage.getItem('meshcore-my-nodes') || '[]');
+    const favs = getFavorites();
+    let changed = false;
+    myNodes.forEach(mn => {
+      if (!favs.includes(mn.pubkey)) { favs.push(mn.pubkey); changed = true; }
+    });
+    if (changed) localStorage.setItem('meshcore-favorites', JSON.stringify(favs));
+  }
+
   let counts = {};
   let selectedKey = null;
   let activeTab = 'all';
@@ -107,7 +117,11 @@
         <div class="node-full-card">
           <div class="node-detail-name" style="font-size:20px">${escapeHtml(n.name || '(unnamed)')}</div>
           <div style="margin:6px 0 12px"><span class="badge" style="background:${roleColor}20;color:${roleColor}">${n.role}</span> ${statusLabel}</div>
-          <div class="node-detail-key mono" style="font-size:11px;word-break:break-all;margin-bottom:12px">${n.public_key}</div>
+          <div class="node-detail-key mono" style="font-size:11px;word-break:break-all;margin-bottom:8px">${n.public_key}</div>
+          <div style="margin-bottom:12px">
+            <button class="btn-primary" id="copyUrlBtn" style="font-size:12px;padding:4px 10px">📋 Copy URL</button>
+            <a href="#/nodes/${encodeURIComponent(n.public_key)}/analytics" class="btn-primary" style="display:inline-block;margin-left:6px;text-decoration:none;font-size:12px;padding:4px 10px">📊 Analytics</a>
+          </div>
           <div class="node-qr" id="nodeFullQrCode"></div>
         </div>
 
@@ -156,11 +170,6 @@
               </div>`;
             }).join('') : '<div class="text-muted">No recent packets</div>'}
           </div>
-        </div>
-
-        <div style="text-align:center;padding:16px">
-          <button class="btn-primary" id="copyUrlBtn">📋 Copy URL</button>
-          <a href="#/nodes/${encodeURIComponent(n.public_key)}/analytics" class="btn-primary" style="display:inline-block;margin-left:8px;text-decoration:none">📊 Analytics</a>
         </div>`;
 
       // Map
@@ -222,6 +231,23 @@
       const data = await api('/nodes?' + params);
       nodes = data.nodes || [];
       counts = data.counts || {};
+
+      // Ensure claimed nodes are always present even if not in current page
+      const myNodes = JSON.parse(localStorage.getItem('meshcore-my-nodes') || '[]');
+      const existingKeys = new Set(nodes.map(n => n.public_key));
+      const missing = myNodes.filter(mn => !existingKeys.has(mn.pubkey));
+      if (missing.length) {
+        const fetched = await Promise.allSettled(
+          missing.map(mn => api('/nodes/' + encodeURIComponent(mn.pubkey)))
+        );
+        fetched.forEach(r => {
+          if (r.status === 'fulfilled' && r.value && r.value.public_key) nodes.push(r.value);
+        });
+      }
+
+      // Auto-sync claimed → favorites
+      syncClaimedToFavorites();
+
       renderCounts();
       renderLeft();
     } catch (e) {
@@ -348,8 +374,9 @@
 
     tbody.innerHTML = sorted.map(n => {
       const roleColor = ROLE_COLORS[n.role] || '#6b7280';
-      return `<tr data-key="${n.public_key}" data-action="select" data-value="${n.public_key}" tabindex="0" role="row" class="${selectedKey === n.public_key ? 'selected' : ''}">
-        <td>${favStar(n.public_key, 'node-fav')}<strong>${n.name || '(unnamed)'}</strong></td>
+      const isClaimed = myKeys.has(n.public_key);
+      return `<tr data-key="${n.public_key}" data-action="select" data-value="${n.public_key}" tabindex="0" role="row" class="${selectedKey === n.public_key ? 'selected' : ''}${isClaimed ? ' claimed-row' : ''}">
+        <td>${favStar(n.public_key, 'node-fav')}${isClaimed ? '<span class="claimed-badge" title="My Mesh">★</span> ' : ''}<strong>${n.name || '(unnamed)'}</strong></td>
         <td class="mono">${truncate(n.public_key, 16)}</td>
         <td><span class="badge" style="background:${roleColor}20;color:${roleColor}">${n.role}</span></td>
         <td>${timeAgo(n.last_seen)}</td>
@@ -409,7 +436,10 @@
       <div class="node-detail">
         ${hasLoc ? `<div class="node-map-container node-detail-map" id="nodeMap" style="border-radius:8px;overflow:hidden;"></div>` : ''}
         <div class="node-detail-name">${escapeHtml(n.name || '(unnamed)')}</div>
-        <div class="node-detail-role"><span class="badge" style="background:${roleColor}20;color:${roleColor}">${n.role}</span> ${statusLabel}</div>
+        <div class="node-detail-role"><span class="badge" style="background:${roleColor}20;color:${roleColor}">${n.role}</span> ${statusLabel}
+          <button class="btn-primary" id="copyUrlBtn" style="font-size:11px;padding:2px 8px;margin-left:8px">📋 URL</button>
+          <a href="#/nodes/${encodeURIComponent(n.public_key)}/analytics" class="btn-primary" style="display:inline-block;margin-left:4px;text-decoration:none;font-size:11px;padding:2px 8px">📊 Analytics</a>
+        </div>
 
         <div class="node-detail-section">
           <h4>Public Key</h4>
@@ -439,11 +469,6 @@
             </div>`).join('')}
           </div>
         </div>` : ''}
-
-        <div style="text-align:center;margin-bottom:16px">
-          <button class="btn-primary" id="copyUrlBtn">📋 Copy URL</button>
-          <a href="#/nodes/${encodeURIComponent(n.public_key)}/analytics" class="btn-primary" style="display:inline-block;margin-left:8px;text-decoration:none">📊 Analytics</a>
-        </div>
 
         <div class="node-detail-section">
           <h4>Recent Packets (${adverts.length})</h4>

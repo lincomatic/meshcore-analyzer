@@ -625,6 +625,67 @@ app.get('/api/nodes/search', (req, res) => {
   res.json({ nodes });
 });
 
+// Bulk health summary for analytics — single query approach (MUST be before :pubkey routes)
+app.get('/api/nodes/bulk-health', (req, res) => {
+  const limit = Math.min(Number(req.query.limit) || 50, 200);
+  const nodes = db.db.prepare(`SELECT * FROM nodes ORDER BY last_seen DESC LIMIT ?`).all(limit);
+  const todayStart = new Date();
+  todayStart.setUTCHours(0, 0, 0, 0);
+  const todayISO = todayStart.toISOString();
+
+  const results = nodes.map(node => {
+    const pk = node.public_key;
+    const keyPattern = `%${pk}%`;
+    const namePattern = node.name ? `%${node.name.replace(/[%_]/g, '')}%` : null;
+    const where = namePattern
+      ? `(decoded_json LIKE @k OR decoded_json LIKE @n)`
+      : `decoded_json LIKE @k`;
+    const p = namePattern ? { k: keyPattern, n: namePattern } : { k: keyPattern };
+
+    const observerRows = db.db.prepare(`
+      SELECT observer_id, observer_name, AVG(snr) as avgSnr, AVG(rssi) as avgRssi, COUNT(*) as packetCount
+      FROM packets WHERE ${where} AND observer_id IS NOT NULL GROUP BY observer_id ORDER BY packetCount DESC
+    `).all(p);
+
+    const totalPackets = db.db.prepare(`SELECT COUNT(*) as c FROM packets WHERE ${where}`).get(p).c;
+    const packetsToday = db.db.prepare(`SELECT COUNT(*) as c FROM packets WHERE ${where} AND timestamp > @s`).get({ ...p, s: todayISO }).c;
+    const avgSnr = db.db.prepare(`SELECT AVG(snr) as v FROM packets WHERE ${where}`).get(p).v;
+    const lastHeard = db.db.prepare(`SELECT MAX(timestamp) as v FROM packets WHERE ${where}`).get(p).v;
+
+    return {
+      public_key: pk,
+      name: node.name,
+      role: node.role,
+      lat: node.lat,
+      lon: node.lon,
+      stats: { totalPackets, packetsToday, avgSnr, lastHeard },
+      observers: observerRows
+    };
+  });
+
+  res.json(results);
+});
+
+app.get('/api/nodes/network-status', (req, res) => {
+  const now = Date.now();
+  const allNodes = db.db.prepare('SELECT public_key, name, role, last_seen FROM nodes').all();
+  let active = 0, degraded = 0, silent = 0;
+  const roleCounts = {};
+  allNodes.forEach(n => {
+    const r = n.role || 'unknown';
+    roleCounts[r] = (roleCounts[r] || 0) + 1;
+    const ls = n.last_seen ? new Date(n.last_seen).getTime() : 0;
+    const age = now - ls;
+    const isInfra = r === 'repeater' || r === 'room';
+    const degradedMs = isInfra ? 86400000 : 3600000;
+    const silentMs = isInfra ? 259200000 : 86400000;
+    if (age < degradedMs) active++;
+    else if (age < silentMs) degraded++;
+    else silent++;
+  });
+  res.json({ total: allNodes.length, active, degraded, silent, roleCounts });
+});
+
 app.get('/api/nodes/:pubkey', (req, res) => {
   const node = db.getNode(req.params.pubkey);
   if (!node) return res.status(404).json({ error: 'Not found' });
