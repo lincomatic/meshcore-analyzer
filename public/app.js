@@ -11,11 +11,65 @@ function payloadTypeName(n) { return PAYLOAD_TYPES[n] || 'UNKNOWN'; }
 function payloadTypeColor(n) { return PAYLOAD_COLORS[n] || 'unknown'; }
 
 // --- Utilities ---
-async function api(path) {
-  const res = await fetch('/api' + path);
-  if (!res.ok) throw new Error(`API ${res.status}: ${path}`);
-  return res.json();
+const _apiPerf = { calls: 0, totalMs: 0, log: [], cacheHits: 0 };
+const _apiCache = new Map();
+const _inflight = new Map();
+async function api(path, { ttl = 0, bust = false } = {}) {
+  const t0 = performance.now();
+  if (!bust && ttl > 0) {
+    const cached = _apiCache.get(path);
+    if (cached && Date.now() < cached.expires) {
+      _apiPerf.calls++;
+      _apiPerf.cacheHits++;
+      _apiPerf.log.push({ path, ms: 0, time: Date.now(), cached: true });
+      if (_apiPerf.log.length > 200) _apiPerf.log.shift();
+      return cached.data;
+    }
+  }
+  // Deduplicate in-flight requests
+  if (_inflight.has(path)) return _inflight.get(path);
+  const promise = (async () => {
+    const res = await fetch('/api' + path);
+    if (!res.ok) throw new Error(`API ${res.status}: ${path}`);
+    const data = await res.json();
+    const ms = performance.now() - t0;
+    _apiPerf.calls++;
+    _apiPerf.totalMs += ms;
+    _apiPerf.log.push({ path, ms: Math.round(ms), time: Date.now() });
+    if (_apiPerf.log.length > 200) _apiPerf.log.shift();
+    if (ms > 500) console.warn(`[SLOW API] ${path} took ${Math.round(ms)}ms`);
+    if (ttl > 0) _apiCache.set(path, { data, expires: Date.now() + ttl });
+    return data;
+  })();
+  _inflight.set(path, promise);
+  promise.finally(() => _inflight.delete(path));
+  return promise;
 }
+
+function invalidateApiCache(prefix) {
+  for (const key of _apiCache.keys()) {
+    if (key.startsWith(prefix || '')) _apiCache.delete(key);
+  }
+}
+// Expose for console debugging: apiPerf()
+window.apiPerf = function() {
+  const byPath = {};
+  _apiPerf.log.forEach(e => {
+    if (!byPath[e.path]) byPath[e.path] = { count: 0, totalMs: 0, maxMs: 0 };
+    byPath[e.path].count++;
+    byPath[e.path].totalMs += e.ms;
+    if (e.ms > byPath[e.path].maxMs) byPath[e.path].maxMs = e.ms;
+  });
+  const rows = Object.entries(byPath).map(([p, s]) => ({
+    path: p, count: s.count, avgMs: Math.round(s.totalMs / s.count), maxMs: s.maxMs,
+    totalMs: Math.round(s.totalMs)
+  })).sort((a, b) => b.totalMs - a.totalMs);
+  console.table(rows);
+  const hitRate = _apiPerf.calls ? Math.round(_apiPerf.cacheHits / _apiPerf.calls * 100) : 0;
+  const misses = _apiPerf.calls - _apiPerf.cacheHits;
+  console.log(`Cache: ${_apiPerf.cacheHits} hits / ${misses} misses (${hitRate}% hit rate)`);
+  return { calls: _apiPerf.calls, avgMs: Math.round(_apiPerf.totalMs / (misses || 1)), cacheHits: _apiPerf.cacheHits, cacheMisses: misses, cacheHitRate: hitRate, endpoints: rows };
+};
 
 function timeAgo(iso) {
   if (!iso) return '—';
@@ -140,6 +194,15 @@ function connectWS() {
   ws.onmessage = (e) => {
     try {
       const msg = JSON.parse(e.data);
+      // Debounce cache invalidation — don't nuke on every packet
+      if (!api._invalidateTimer) {
+        api._invalidateTimer = setTimeout(() => {
+          api._invalidateTimer = null;
+          invalidateApiCache('/stats');
+          invalidateApiCache('/nodes');
+          invalidateApiCache('/channels');
+        }, 5000);
+      }
       wsListeners.forEach(fn => fn(msg));
     } catch {}
   };
@@ -217,7 +280,10 @@ function navigate() {
 
   const app = document.getElementById('app');
   if (pages[basePage]?.init) {
+    const t0 = performance.now();
     pages[basePage].init(app, routeParam);
+    const ms = performance.now() - t0;
+    if (ms > 100) console.warn(`[SLOW PAGE] ${basePage} init took ${Math.round(ms)}ms`);
     app.classList.remove('page-enter'); void app.offsetWidth; app.classList.add('page-enter');
   } else {
     app.innerHTML = `<div style="padding:40px;text-align:center;color:#6b7280"><h2>${route}</h2><p>Page not yet implemented.</p></div>`;
@@ -290,7 +356,7 @@ window.addEventListener('DOMContentLoaded', () => {
     favDropdown.innerHTML = '<div class="fav-dd-loading">Loading...</div>';
     const items = await Promise.all(favs.map(async (pk) => {
       try {
-        const h = await api('/nodes/' + pk + '/health');
+        const h = await api('/nodes/' + pk + '/health', { ttl: 30000 });
         const age = h.stats.lastHeard ? Date.now() - new Date(h.stats.lastHeard).getTime() : null;
         const status = age === null ? '🔴' : age < 3600000 ? '🟢' : age < 86400000 ? '🟡' : '🔴';
         return '<a href="#/nodes/' + pk + '" class="fav-dd-item" data-key="' + pk + '">'
@@ -394,7 +460,7 @@ window.addEventListener('DOMContentLoaded', () => {
   // --- Nav Stats ---
   async function updateNavStats() {
     try {
-      const stats = await api('/stats');
+      const stats = await api('/stats', { ttl: 5000 });
       const el = document.getElementById('navStats');
       if (el) {
         el.innerHTML = `<span class="stat-val">${stats.totalPackets}</span> pkts · <span class="stat-val">${stats.totalNodes}</span> nodes · <span class="stat-val">${stats.totalObservers}</span> obs`;

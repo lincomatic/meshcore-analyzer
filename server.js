@@ -51,6 +51,43 @@ if (Object.keys(derivedHashChannelKeys).length > 0) {
   console.log(`Derived ${Object.keys(derivedHashChannelKeys).length} channel key(s) from hashChannels`);
 }
 
+// --- TTL Cache ---
+class TTLCache {
+  constructor() { this.store = new Map(); this.hits = 0; this.misses = 0; }
+  get(key) {
+    const entry = this.store.get(key);
+    if (!entry) { this.misses++; return undefined; }
+    if (Date.now() > entry.expires) { this.store.delete(key); this.misses++; return undefined; }
+    this.hits++;
+    return entry.value;
+  }
+  set(key, value, ttlMs) {
+    this.store.set(key, { value, expires: Date.now() + ttlMs });
+  }
+  invalidate(prefix) {
+    for (const key of this.store.keys()) {
+      if (key.startsWith(prefix)) this.store.delete(key);
+    }
+  }
+  // Debounced invalidation — wait for burst of packets to settle
+  debouncedInvalidateAll() {
+    if (this._debounceTimer) return; // already scheduled
+    this._debounceTimer = setTimeout(() => {
+      this._debounceTimer = null;
+      this.invalidate('analytics:');
+      this.invalidate('channels');
+      this.invalidate('node:');
+      this.invalidate('health:');
+      this.invalidate('observers');
+      this.invalidate('bulk-health');
+    }, 5000); // batch invalidations over 5s window
+  }
+  clear() { this.store.clear(); }
+  get size() { return this.store.size; }
+}
+const cache = new TTLCache();
+
+
 // Seed DB if empty
 //db.seed();
 
@@ -66,6 +103,72 @@ if (config.https && config.https.cert && config.https.key) {
 } else {
   server = http.createServer(app);
 }
+
+// --- Performance Instrumentation ---
+const perfStats = {
+  requests: 0,
+  totalMs: 0,
+  endpoints: {},  // { path: { count, totalMs, maxMs, avgMs, p95: [], lastSlow } }
+  slowQueries: [], // last 50 requests > 100ms
+  startedAt: Date.now(),
+  reset() {
+    this.requests = 0; this.totalMs = 0; this.endpoints = {}; this.slowQueries = []; this.startedAt = Date.now();
+  }
+};
+
+app.use((req, res, next) => {
+  if (!req.path.startsWith('/api/')) return next();
+  const start = process.hrtime.bigint();
+  const origEnd = res.end;
+  res.end = function(...args) {
+    const ms = Number(process.hrtime.bigint() - start) / 1e6;
+    perfStats.requests++;
+    perfStats.totalMs += ms;
+    // Normalize parameterized routes
+    const key = req.route ? req.route.path : req.path.replace(/[0-9a-f]{8,}/gi, ':id');
+    if (!perfStats.endpoints[key]) perfStats.endpoints[key] = { count: 0, totalMs: 0, maxMs: 0, recent: [] };
+    const ep = perfStats.endpoints[key];
+    ep.count++;
+    ep.totalMs += ms;
+    if (ms > ep.maxMs) ep.maxMs = ms;
+    ep.recent.push(ms);
+    if (ep.recent.length > 100) ep.recent.shift();
+    if (ms > 100) {
+      perfStats.slowQueries.push({ path: req.path, ms: Math.round(ms * 10) / 10, time: new Date().toISOString(), status: res.statusCode });
+      if (perfStats.slowQueries.length > 50) perfStats.slowQueries.shift();
+    }
+    origEnd.apply(res, args);
+  };
+  next();
+});
+
+app.get('/api/perf', (req, res) => {
+  const summary = {};
+  for (const [path, ep] of Object.entries(perfStats.endpoints)) {
+    const sorted = [...ep.recent].sort((a, b) => a - b);
+    const p95 = sorted[Math.floor(sorted.length * 0.95)] || 0;
+    const p50 = sorted[Math.floor(sorted.length * 0.5)] || 0;
+    summary[path] = {
+      count: ep.count,
+      avgMs: Math.round(ep.totalMs / ep.count * 10) / 10,
+      p50Ms: Math.round(p50 * 10) / 10,
+      p95Ms: Math.round(p95 * 10) / 10,
+      maxMs: Math.round(ep.maxMs * 10) / 10,
+    };
+  }
+  // Sort by total time spent (count * avg) descending
+  const sorted = Object.entries(summary).sort((a, b) => (b[1].count * b[1].avgMs) - (a[1].count * a[1].avgMs));
+  res.json({
+    uptime: Math.round((Date.now() - perfStats.startedAt) / 1000),
+    totalRequests: perfStats.requests,
+    avgMs: perfStats.requests ? Math.round(perfStats.totalMs / perfStats.requests * 10) / 10 : 0,
+    endpoints: Object.fromEntries(sorted),
+    slowQueries: perfStats.slowQueries.slice(-20),
+    cache: { size: cache.size, hits: cache.hits, misses: cache.misses, hitRate: cache.hits + cache.misses > 0 ? Math.round(cache.hits / (cache.hits + cache.misses) * 1000) / 10 : 0 },
+  });
+});
+
+app.post('/api/perf/reset', (req, res) => { perfStats.reset(); res.json({ ok: true }); });
 
 // --- WebSocket ---
 const wss = new WebSocketServer({ server });
@@ -244,6 +347,10 @@ try {
         if (observerId) {
           db.upsertObserver({ id: observerId, iata: region });
         }
+
+
+    // Invalidate caches on new data
+    cache.debouncedInvalidateAll();
 
         const broadcastData = { id: packetId, raw: msg.raw, decoded, snr: msg.SNR, rssi: msg.RSSI, hash: msg.hash, observer: observerId };
         broadcast({ type: 'packet', data: broadcastData });
@@ -580,6 +687,10 @@ app.post('/api/packets', (req, res) => {
       db.upsertObserver({ id: observer, iata: region || null });
     }
 
+
+    // Invalidate caches on new data
+    cache.debouncedInvalidateAll();
+
     broadcast({ type: 'packet', data: { id: packetId, decoded } });
 
     res.json({ id: packetId, decoded });
@@ -628,41 +739,85 @@ app.get('/api/nodes/search', (req, res) => {
 // Bulk health summary for analytics — single query approach (MUST be before :pubkey routes)
 app.get('/api/nodes/bulk-health', (req, res) => {
   const limit = Math.min(Number(req.query.limit) || 50, 200);
+  const _ck = 'bulk-health:' + limit;
+  const _c = cache.get(_ck); if (_c) return res.json(_c);
+
   const nodes = db.db.prepare(`SELECT * FROM nodes ORDER BY last_seen DESC LIMIT ?`).all(limit);
   const todayStart = new Date();
   todayStart.setUTCHours(0, 0, 0, 0);
   const todayISO = todayStart.toISOString();
 
-  const results = nodes.map(node => {
-    const pk = node.public_key;
-    const keyPattern = `%${pk}%`;
-    const namePattern = node.name ? `%${node.name.replace(/[%_]/g, '')}%` : null;
-    const where = namePattern
-      ? `(decoded_json LIKE @k OR decoded_json LIKE @n)`
-      : `decoded_json LIKE @k`;
-    const p = namePattern ? { k: keyPattern, n: namePattern } : { k: keyPattern };
+  if (nodes.length === 0) { cache.set(_ck, [], 60000); return res.json([]); }
 
-    const observerRows = db.db.prepare(`
-      SELECT observer_id, observer_name, AVG(snr) as avgSnr, AVG(rssi) as avgRssi, COUNT(*) as packetCount
-      FROM packets WHERE ${where} AND observer_id IS NOT NULL GROUP BY observer_id ORDER BY packetCount DESC
-    `).all(p);
-
-    const totalPackets = db.db.prepare(`SELECT COUNT(*) as c FROM packets WHERE ${where}`).get(p).c;
-    const packetsToday = db.db.prepare(`SELECT COUNT(*) as c FROM packets WHERE ${where} AND timestamp > @s`).get({ ...p, s: todayISO }).c;
-    const avgSnr = db.db.prepare(`SELECT AVG(snr) as v FROM packets WHERE ${where}`).get(p).v;
-    const lastHeard = db.db.prepare(`SELECT MAX(timestamp) as v FROM packets WHERE ${where}`).get(p).v;
-
-    return {
-      public_key: pk,
-      name: node.name,
-      role: node.role,
-      lat: node.lat,
-      lon: node.lon,
-      stats: { totalPackets, packetsToday, avgSnr, lastHeard },
-      observers: observerRows
-    };
+  // Build OR conditions for all nodes to fetch matching packets in ONE query
+  const likeConditions = [];
+  const params = {};
+  nodes.forEach((node, i) => {
+    params['k' + i] = '%' + node.public_key + '%';
+    likeConditions.push('decoded_json LIKE @k' + i);
+    if (node.name) {
+      params['n' + i] = '%' + node.name.replace(/[%_]/g, '') + '%';
+      likeConditions.push('decoded_json LIKE @n' + i);
+    }
   });
 
+  // Single query to get ALL matching packets
+  const allPackets = db.db.prepare(
+    'SELECT decoded_json, snr, rssi, timestamp, observer_id, observer_name FROM packets WHERE ' + likeConditions.join(' OR ')
+  ).all(params);
+
+  // Match packets to nodes in JS
+  const nodeMap = new Map();
+  for (const node of nodes) {
+    nodeMap.set(node.public_key, {
+      node, totalPackets: 0, packetsToday: 0, snrSum: 0, snrCount: 0, lastHeard: null,
+      observers: {}
+    });
+  }
+
+  for (const pkt of allPackets) {
+    const dj = pkt.decoded_json || '';
+    for (const [pk, data] of nodeMap) {
+      const nd = data.node;
+      if (!dj.includes(pk) && !(nd.name && dj.includes(nd.name))) continue;
+      data.totalPackets++;
+      if (pkt.timestamp > todayISO) data.packetsToday++;
+      if (pkt.snr != null) { data.snrSum += pkt.snr; data.snrCount++; }
+      if (!data.lastHeard || pkt.timestamp > data.lastHeard) data.lastHeard = pkt.timestamp;
+      if (pkt.observer_id) {
+        if (!data.observers[pkt.observer_id]) {
+          data.observers[pkt.observer_id] = { name: pkt.observer_name, snrSum: 0, snrCount: 0, rssiSum: 0, rssiCount: 0, count: 0 };
+        }
+        const obs = data.observers[pkt.observer_id];
+        obs.count++;
+        if (pkt.snr != null) { obs.snrSum += pkt.snr; obs.snrCount++; }
+        if (pkt.rssi != null) { obs.rssiSum += pkt.rssi; obs.rssiCount++; }
+      }
+    }
+  }
+
+  const results = [];
+  for (const [pk, data] of nodeMap) {
+    const observerRows = Object.entries(data.observers)
+      .map(([id, o]) => ({
+        observer_id: id, observer_name: o.name,
+        avgSnr: o.snrCount ? o.snrSum / o.snrCount : null,
+        avgRssi: o.rssiCount ? o.rssiSum / o.rssiCount : null,
+        packetCount: o.count
+      }))
+      .sort((a, b) => b.packetCount - a.packetCount);
+    results.push({
+      public_key: pk, name: data.node.name, role: data.node.role,
+      lat: data.node.lat, lon: data.node.lon,
+      stats: {
+        totalPackets: data.totalPackets, packetsToday: data.packetsToday,
+        avgSnr: data.snrCount ? data.snrSum / data.snrCount : null, lastHeard: data.lastHeard
+      },
+      observers: observerRows
+    });
+  }
+
+  cache.set(_ck, results, 60000);
   res.json(results);
 });
 
@@ -687,16 +842,21 @@ app.get('/api/nodes/network-status', (req, res) => {
 });
 
 app.get('/api/nodes/:pubkey', (req, res) => {
+  const _ck = 'node:' + req.params.pubkey;
+  const _c = cache.get(_ck); if (_c) return res.json(_c);
   const node = db.getNode(req.params.pubkey);
   if (!node) return res.status(404).json({ error: 'Not found' });
   const recentAdverts = node.recentPackets || [];
   delete node.recentPackets;
-  res.json({ node, recentAdverts });
+  const _nResult = { node, recentAdverts };
+  cache.set(_ck, _nResult, 30000);
+  res.json(_nResult);
 });
 
 // --- Analytics API ---
 // --- RF Analytics ---
 app.get('/api/analytics/rf', (req, res) => {
+  const _c = cache.get('analytics:rf'); if (_c) return res.json(_c);
   const PTYPES = { 0:'REQ',1:'RESPONSE',2:'TXT_MSG',3:'ACK',4:'ADVERT',5:'GRP_TXT',7:'ANON_REQ',8:'PATH',9:'TRACE',11:'CONTROL' };
   const packets = db.db.prepare(`SELECT snr, rssi, payload_type, timestamp, raw_hex FROM packets WHERE snr IS NOT NULL`).all();
 
@@ -757,7 +917,7 @@ app.get('/api/analytics/rf', (req, res) => {
   const times = packets.map(p => new Date(p.timestamp).getTime());
   const timeSpanHours = times.length ? (Math.max(...times) - Math.min(...times)) / 3600000 : 0;
 
-  res.json({
+  const _rfResult = {
     totalPackets: packets.length,
     snr: { min: Math.min(...snrVals), max: Math.max(...snrVals), avg: snrAvg, median: median(snrVals), stddev: stddev(snrVals, snrAvg) },
     rssi: { min: Math.min(...rssiVals), max: Math.max(...rssiVals), avg: rssiAvg, median: median(rssiVals), stddev: stddev(rssiVals, rssiAvg) },
@@ -766,11 +926,14 @@ app.get('/api/analytics/rf', (req, res) => {
     maxPacketSize: packetSizes.length ? Math.max(...packetSizes) : 0,
     avgPacketSize: packetSizes.length ? Math.round(packetSizes.reduce((a, b) => a + b, 0) / packetSizes.length) : 0,
     packetsPerHour, payloadTypes, snrByType: snrByTypeArr, signalOverTime, scatterData, timeSpanHours
-  });
+  };
+  cache.set('analytics:rf', _rfResult, 300000);
+  res.json(_rfResult);
 });
 
 // --- Topology Analytics ---
 app.get('/api/analytics/topology', (req, res) => {
+  const _c = cache.get('analytics:topology'); if (_c) return res.json(_c);
   const packets = db.db.prepare(`SELECT path_json, snr, decoded_json, observer_id FROM packets WHERE path_json IS NOT NULL AND path_json != '[]'`).all();
   const allNodes = db.db.prepare('SELECT public_key, name, lat, lon FROM nodes WHERE name IS NOT NULL').all();
   const resolveHop = (hop, contextPositions) => {
@@ -921,7 +1084,7 @@ app.get('/api/analytics/topology', (req, res) => {
     .sort((a, b) => a.minDist - b.minDist)
     .slice(0, 50);
 
-  res.json({
+  const _topoResult = {
     uniqueNodes: new Set(Object.keys(hopFreq)).size,
     avgHops, medianHops, maxHops,
     hopDistribution, topRepeaters, topPairs, hopsVsSnr,
@@ -929,11 +1092,14 @@ app.get('/api/analytics/topology', (req, res) => {
     perObserverReach,
     multiObsNodes,
     bestPathList
-  });
+  };
+  cache.set('analytics:topology', _topoResult, 300000);
+  res.json(_topoResult);
 });
 
 // --- Channel Analytics ---
 app.get('/api/analytics/channels', (req, res) => {
+  const _c = cache.get('analytics:channels'); if (_c) return res.json(_c);
   const packets = db.db.prepare(`SELECT decoded_json, timestamp FROM packets WHERE payload_type = 5 AND decoded_json IS NOT NULL`).all();
 
   const channels = {};
@@ -982,17 +1148,20 @@ app.get('/api/analytics/channels', (req, res) => {
     })
     .sort((a, b) => a.hour.localeCompare(b.hour));
 
-  res.json({
+  const _chanResult = {
     activeChannels: channelList.length,
     decryptable: channelList.filter(c => !c.encrypted).length,
     channels: channelList,
     topSenders,
     channelTimeline,
     msgLengths
-  });
+  };
+  cache.set('analytics:channels', _chanResult, 300000);
+  res.json(_chanResult);
 });
 
 app.get('/api/analytics/hash-sizes', (req, res) => {
+  const _c = cache.get('analytics:hash-sizes'); if (_c) return res.json(_c);
   // Get all packets with raw_hex and non-empty paths, extract hash_size from path_length byte
   const packets = db.db.prepare(`
     SELECT raw_hex, path_json, timestamp, payload_type, decoded_json
@@ -1072,13 +1241,15 @@ app.get('/api/analytics/hash-sizes', (req, res) => {
     .sort(([, a], [, b]) => b.packets - a.packets)
     .map(([name, data]) => ({ name, ...data }));
 
-  res.json({
+  const _hsResult = {
     total: packets.length,
     distribution,
     hourly,
     topHops,
     multiByteNodes
-  });
+  };
+  cache.set('analytics:hash-sizes', _hsResult, 300000);
+  res.json(_hsResult);
 });
 
 // Resolve path hop hex prefixes to node names
@@ -1228,6 +1399,7 @@ const channelHashNames = {};
 }
 
 app.get('/api/channels', (req, res) => {
+  const _c = cache.get('channels'); if (_c) return res.json(_c);
   const packets = db.db.prepare(`SELECT * FROM packets WHERE payload_type = 5 ORDER BY timestamp DESC`).all();
   const channelMap = {};
 
@@ -1286,10 +1458,14 @@ app.get('/api/channels', (req, res) => {
     // Don't double-count if already counted above
   }
 
-  res.json({ channels: Object.values(channelMap) });
+  const _chResult = { channels: Object.values(channelMap) };
+  cache.set('channels', _chResult, 30000);
+  res.json(_chResult);
 });
 
 app.get('/api/channels/:hash/messages', (req, res) => {
+  const _ck = 'channels:' + req.params.hash + ':' + (req.query.limit||100) + ':' + (req.query.offset||0);
+  const _c = cache.get(_ck); if (_c) return res.json(_c);
   const { limit = 100, offset = 0 } = req.query;
   const channelHash = req.params.hash;
   const packets = db.db.prepare(`SELECT * FROM packets WHERE payload_type = 5 ORDER BY timestamp ASC`).all();
@@ -1349,17 +1525,22 @@ app.get('/api/channels/:hash/messages', (req, res) => {
   const start = Math.max(0, total - Number(limit) - Number(offset));
   const end = total - Number(offset);
   const messages = allMessages.slice(Math.max(0, start), Math.max(0, end));
-  res.json({ messages, total });
+  const _msgResult = { messages, total };
+  cache.set(_ck, _msgResult, 15000);
+  res.json(_msgResult);
 });
 
 app.get('/api/observers', (req, res) => {
+  const _c = cache.get('observers'); if (_c) return res.json(_c);
   const observers = db.getObservers();
   const oneHourAgo = new Date(Date.now() - 3600000).toISOString();
   const result = observers.map(o => {
     const lastHour = db.db.prepare(`SELECT COUNT(*) as count FROM packets WHERE observer_id = ? AND timestamp > ?`).get(o.id, oneHourAgo);
     return { ...o, packetsLastHour: lastHour.count };
   });
-  res.json({ observers: result, server_time: new Date().toISOString() });
+  const _oResult = { observers: result, server_time: new Date().toISOString() };
+  cache.set('observers', _oResult, 30000);
+  res.json(_oResult);
 });
 
 app.get('/api/traces/:hash', (req, res) => {
@@ -1369,8 +1550,11 @@ app.get('/api/traces/:hash', (req, res) => {
 });
 
 app.get('/api/nodes/:pubkey/health', (req, res) => {
+  const _ck = 'health:' + req.params.pubkey;
+  const _c = cache.get(_ck); if (_c) return res.json(_c);
   const health = db.getNodeHealth(req.params.pubkey);
   if (!health) return res.status(404).json({ error: 'Not found' });
+  cache.set(_ck, health, 30000);
   res.json(health);
 });
 
@@ -1383,6 +1567,8 @@ app.get('/api/nodes/:pubkey/analytics', (req, res) => {
 
 // Subpath frequency analysis
 app.get('/api/analytics/subpaths', (req, res) => {
+  const _ck = 'analytics:subpaths:' + (req.query.minLen||2) + ':' + (req.query.maxLen||8) + ':' + (req.query.limit||100);
+  const _c = cache.get(_ck); if (_c) return res.json(_c);
   const minLen = Math.max(2, Number(req.query.minLen) || 2);
   const maxLen = Number(req.query.maxLen) || 8;
   const packets = db.db.prepare(`SELECT path_json FROM packets WHERE path_json IS NOT NULL AND path_json != '[]'`).all();
@@ -1434,11 +1620,15 @@ app.get('/api/analytics/subpaths', (req, res) => {
     .sort((a, b) => b.count - a.count)
     .slice(0, limit);
 
-  res.json({ subpaths: ranked, totalPaths });
+  const _spResult = { subpaths: ranked, totalPaths };
+  cache.set(_ck, _spResult, 600000);
+  res.json(_spResult);
 });
 
 // Subpath detail — stats for a specific subpath (by raw hop prefixes)
 app.get('/api/analytics/subpath-detail', (req, res) => {
+  const _sdck = 'analytics:subpath-detail:' + (req.query.hops || '');
+  const _sdc = cache.get(_sdck); if (_sdc) return res.json(_sdc);
   const rawHops = (req.query.hops || '').split(',').filter(Boolean);
   if (rawHops.length < 2) return res.json({ error: 'Need at least 2 hops' });
 
@@ -1498,7 +1688,7 @@ app.get('/api/analytics/subpath-detail', (req, res) => {
     .slice(0, 10)
     .map(([name, count]) => ({ name, count }));
 
-  res.json({
+    const _sdResult = {
     hops: rawHops,
     nodes,
     totalMatches: matching.length,
@@ -1512,7 +1702,9 @@ app.get('/api/analytics/subpath-detail', (req, res) => {
     hourDistribution: hourBuckets,
     parentPaths: topParents,
     observers: topObservers
-  });
+  };
+  cache.set(_sdck, _sdResult, 600000);
+  res.json(_sdResult);
 });
 
 // Static files + SPA fallback
